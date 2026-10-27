@@ -217,6 +217,28 @@ class ApiAntiSlopSampler:
         self.min_p = gen.get("min_p")
         self.stop_sequences = gen.get("stop_sequences")
         self.timeout = gen.get("timeout", 120)
+
+        # ── early end-of-turn (EOS) handling ────────────────────────────────
+        # Gemma-class models sampling at temperature > 0 emit their end-of-turn
+        # marker (e.g. <end_of_turn> / <turn|>) prematurely ~20% of the time;
+        # vLLM then reports finish_reason="stop".  Two bugs followed:
+        #   • Bug 1 — the marker token was flushed into the visible output.
+        #   • Bug 2 — a mid-sentence stop truncated the response.
+        # The fix strips any trailing end-of-turn marker token(s) from each
+        # chunk *before* they enter the generation state (so they never leak
+        # out), and treats the accompanying "stop" as an early, non-terminal
+        # signal — continuing generation until max_consecutive_stops such
+        # stops are seen back-to-back (safety valve against infinite loops).
+        # A "stop" WITHOUT a marker is still treated as genuinely terminal,
+        # so user-configured stop_sequences keep working.
+        eos_markers = gen.get("end_of_turn_markers") or [
+            "<end_of_turn>",
+            "<turn|>",
+        ]
+        self.end_of_turn_markers: List[str] = [str(m).strip().lower() for m in eos_markers]
+        self.max_consecutive_stops = max(1, int(gen.get("max_consecutive_stops", 3)))
+        # Counter for consecutive early end-of-turn stops (safety valve).
+        self._consecutive_stops = 0
         self.chat_formatter = chat_template_formatter
         self.force_backtrack = bool(config.get("backtracking", {}).get("force_backtrack", False))
 
@@ -715,6 +737,105 @@ class ApiAntiSlopSampler:
                 earliest = vio
         return earliest
 
+    # ------------------------------------------------------------------ #
+    #  Early end-of-turn marker handling                                 #
+    # ------------------------------------------------------------------ #
+    def _is_end_of_turn_token(self, token: str) -> bool:
+        """True if *token* (raw or decoded, lower-cased) is a configured
+        end-of-turn marker.  Matching is done on both forms because the API
+        may render the same special token differently (canonical name vs.
+        tokenizer-internal name)."""
+        if not self.end_of_turn_markers or not token:
+            return False
+        marker_set = set(self.end_of_turn_markers)
+        return (
+            token.strip().lower() in marker_set
+            or _decode_token(token).strip().lower() in marker_set
+        )
+
+    def _sanitize_chunk_eos(self, chunk: "ApiChunkResult") -> int:
+        """
+        Remove every trailing end-of-turn marker token from *chunk* (and its
+        logprob entry) so the marker can never be appended to the generation
+        state or yielded to the user.  This runs on **every** chunk, whether
+        or not a stop signal is present, so a legitimately-final marker is
+        also scrubbed from the output (Bug 1).  Callers use the return value
+        together with :meth:`_handle_stop` to decide whether to continue.
+        Returns the number of marker tokens removed.
+        """
+        removed = 0
+        while chunk.token_strings and self._is_end_of_turn_token(
+            chunk.token_strings[-1]
+        ):
+            rel_pos = len(chunk.token_strings) - 1
+            chunk.token_strings.pop()
+            chunk.logprobs.pop(rel_pos, None)
+            removed += 1
+        return removed
+
+    def _handle_stop(self, reason: Optional[str], had_eos_marker: bool) -> bool:
+        """
+        Decide how to react to a backend stop signal.
+
+        *had_eos_marker* is True when an end-of-turn marker token was stripped
+        anywhere in the current stream attempt (see
+        :meth:`_sanitize_chunk_eos`) — the tell-tale sign that the model
+        emitted its <end_of_turn> / <turn|> token prematurely (roughly one in
+        five samplings at temperature > 0).  Those marker tokens have already
+        been removed, so nothing leaks into the output.
+
+        Rules:
+        - ``"length"``            → per-request budget only; keep generating.
+        - ``"stop"`` + marker     → premature EOS; keep generating until
+                                    ``max_consecutive_stops`` early stops are
+                                    seen back-to-back (safety valve against an
+                                    infinite loop if the model keeps trying to
+                                    end its turn), then accept the stop.
+        - ``"stop"`` w/o marker   → a real terminal signal (e.g. a user
+                                    stop-sequence); accept it immediately.
+        - other reason + marker   → the stream simply closed as a side-effect
+                                    of the stripped early EOS (e.g. vLLM's
+                                    ``stream_end`` / ``[DONE]``); keep
+                                    generating.
+        - other reason, no marker → genuine stream end; accept.
+
+        Returns True → accept the stop (terminate the run).
+        Returns False → reject it (keep generating).
+        """
+        if not reason:
+            self._consecutive_stops = 0
+            return False
+        if reason == "length":
+            self._consecutive_stops = 0
+            return False
+
+        logger.info(f"finish_reason={reason}")
+        if reason == "stop" and had_eos_marker:
+            self._consecutive_stops += 1
+            if self._consecutive_stops < self.max_consecutive_stops:
+                logger.warning(
+                    "Early end-of-turn marker stripped (consecutive stop "
+                    "%d/%d); continuing generation.",
+                    self._consecutive_stops, self.max_consecutive_stops,
+                )
+                return False
+            logger.warning(
+                "End-of-turn markers hit %d consecutive stops; accepting the "
+                "stop (safety valve).", self.max_consecutive_stops,
+            )
+            self._consecutive_stops = 0
+            return True
+
+        if had_eos_marker and reason in ("stream_end", None, ""):
+            # The SSE stream closed (``stream_end`` / ``[DONE]``) purely as a
+            # side-effect of the early EOS token we stripped above; it does
+            # NOT represent a terminal intent → keep generating.
+            return False
+
+        # "stop" without any marker (a user stop_sequence), or a normal end of
+        # stream with no early EOS involved → genuinely terminal.
+        self._consecutive_stops = 0
+        return True
 
     def generate(
         self,
@@ -743,6 +864,9 @@ class ApiAntiSlopSampler:
         effective_top_p = self.top_p if top_p is None else top_p
         effective_top_k = self.top_k if top_k is None else top_k
 
+        # fresh early-stop safety-valve budget for this generation run
+        self._consecutive_stops = 0
+
         if self.request_mode == "stream":
             yield from self._generate_streamwise(
                 prompt,
@@ -762,6 +886,9 @@ class ApiAntiSlopSampler:
                 top_k=effective_top_k,
             )
 
+    # ------------------------------------------------------------------ #
+    #  Streaming generation with proper restart on back-track            #
+    # ------------------------------------------------------------------ #
     # ------------------------------------------------------------------ #
     #  Streaming generation with proper restart on back-track            #
     # ------------------------------------------------------------------ #
@@ -798,10 +925,38 @@ class ApiAntiSlopSampler:
                 stop_sequences  = self.stop_sequences,
             )
 
+            # NOTE: `self._consecutive_stops` is intentionally NOT reset here.
+            # It accumulates across stream attempts for the lifetime of this
+            # generation run (see generate()).  vLLM ends the SSE stream the
+            # moment an EOS token is emitted, so every premature end-of-turn
+            # marker we strip costs us one stream attempt; the accumulator
+            # therefore bounds the total number of restarts caused by early
+            # end-of-turn emissions (safety valve against infinite loops).
+            #
+            # Remembers that an end-of-turn marker was stripped somewhere in
+            # this stream.  Some backends put the marker in one token chunk but
+            # deliver finish_reason="stop" on a later (empty) control chunk;
+            # latching the flag lets us still treat that as an early-EOS stop.
+            saw_eos_marker = False
+
             for chunk in stream:
+                # Strip any trailing end-of-turn marker token(s) BEFORE
+                # anything is appended or yielded, so they can never leak
+                # into the output (fixes Bug 1).  Runs on every chunk.
+                if self._sanitize_chunk_eos(chunk):
+                    saw_eos_marker = True
+
                 if not chunk.token_strings:
-                    if chunk.finish_reason and chunk.finish_reason != "length":
-                        natural_end = True
+                    # Control-only chunk: [DONE], or a chunk that consisted
+                    # solely of end-of-turn marker token(s).
+                    # finish_reason may ride on the marker chunk itself or on
+                    # this separate empty chunk.
+                    if chunk.finish_reason:
+                        if self._handle_stop(
+                            chunk.finish_reason, had_eos_marker=saw_eos_marker
+                        ):
+                            natural_end = True
+                        saw_eos_marker = False
                         break
                     continue
 
@@ -812,7 +967,7 @@ class ApiAntiSlopSampler:
 
                 if delta and self.on_chunk_yielded_callback:
                     try:
-                        # empty text → caller knows this count is “accepted, not yet flushed”
+                        # empty text → caller knows this count is "accepted, not yet flushed"
                         self.on_chunk_yielded_callback("", delta)
                     except Exception as e_cb:
                         logger.error("Throughput callback failed: %s", e_cb, exc_info=True)
@@ -868,9 +1023,27 @@ class ApiAntiSlopSampler:
                     last_yield = safe_upto
 
                 # ---------- natural termination inside stream --------------
-                if chunk.finish_reason and chunk.finish_reason != "length":
-                    natural_end = True
-                    break
+                # Note: We check finish_reason AFTER appending the chunk and yielding safe prefix.
+                # This ensures all tokens are processed before deciding to stop.
+                if chunk.finish_reason:
+                    if self._handle_stop(
+                        chunk.finish_reason, had_eos_marker=saw_eos_marker
+                    ):
+                        # Genuine termination: a real stop sequence, a stop
+                        # after the safety-valve limit, or another terminal
+                        # reason.  Any trailing end-of-turn marker was already
+                        # stripped, so it is not flushed to the output.
+                        natural_end = True
+                        break
+                    # A premature end-of-turn marker was stripped and the stop
+                    # rejected: keep the outer while-loop going.  NOTE — do NOT
+                    # clear saw_eos_marker here: vLLM typically sends a final
+                    # empty control chunk (finish_reason="stream_end") right
+                    # after the EOS token, and _handle_stop must still see the
+                    # latched marker to treat that closing chunk as a
+                    # side-effect of the early EOS rather than a real terminal
+                    # (fixes Bug 2).  The flag is re-initialised at the top of
+                    # each outer-loop pass.
 
                 if run_regex:
                     regex_since = 0
@@ -1016,7 +1189,21 @@ class ApiAntiSlopSampler:
 
             api_sec = time.perf_counter() - t0
 
-            if not chunk.token_strings:            # end-of-stream
+            # Strip any trailing end-of-turn marker token(s) BEFORE the chunk
+            # enters the generation state, so they can never be flushed to the
+            # output (fixes Bug 1).  The chunk may consist *solely* of such
+            # token(s); remember whether we saw one so the stop signal below
+            # is recognised as a premature end-of-turn emission.
+            had_eos_marker = bool(self._sanitize_chunk_eos(chunk))
+
+            if not chunk.token_strings:            # end-of-stream (or all-EOS)
+                if chunk.finish_reason:
+                    if self._handle_stop(
+                        chunk.finish_reason, had_eos_marker=had_eos_marker
+                    ):
+                        break
+                    # premature end-of-turn marker → continue the run
+                    continue
                 break
 
             # ── append & validate timing ────────────────────────────────────
@@ -1074,10 +1261,19 @@ class ApiAntiSlopSampler:
                     yield text_to_yield
                 last_yield_idx = safe_upto
 
-            # stop if backend signalled completion
-            if chunk.finish_reason and chunk.finish_reason != "length":
-                logger.info(f"finish_reason={chunk.finish_reason}")
-                break
+            # stop if backend signalled completion.
+            # NOTE: finish_reason="stop" can be premature — Gemma emits its
+            # end-of-turn marker mid-response ~20% of the time under sampling
+            # (the marker was already stripped above).  _handle_stop() rejects
+            # such early stops until the safety-valve limit
+            # (max_consecutive_stops) is reached, so generation continues
+            # instead of being cut off mid-sentence (fixes Bug 2).
+            if chunk.finish_reason:
+                if self._handle_stop(
+                    chunk.finish_reason, had_eos_marker=had_eos_marker
+                ):
+                    break
+                # rejected early end-of-turn stop → loop back and keep going
 
         # ── flush residual tail ────────────────────────────────────────────
         if state.get_generated_length() > last_yield_idx:
