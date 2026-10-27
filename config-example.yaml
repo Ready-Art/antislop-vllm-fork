@@ -52,6 +52,19 @@ generation_params:
   
   timeout: 120        # seconds
   stop_sequences: []
+  # End-of-turn markers the model may emit prematurely under sampling.
+  # Any such token arriving as the last token(s) of a chunk is stripped
+  # BEFORE it enters the generation state (so it never leaks into the
+  # output), and the accompanying finish_reason="stop" is treated as an
+  # early, non-terminal signal: generation continues instead of being cut
+  # off mid-sentence.  Set to [] to disable this handling.
+  end_of_turn_markers:
+    - "<end_of_turn>"
+    - "<turn|>"
+  # Max consecutive early end-of-turn stops tolerated before we accept the
+  # stop (safety valve against infinite loops).  A "stop" that does NOT come
+  # with a marker token (e.g. a user stop_sequence) is still terminal.
+  max_consecutive_stops: 3
   # If true, the banlist only takes effects on whole words/phrases that
   # are bounded by non-word characters.
   # Examples:
