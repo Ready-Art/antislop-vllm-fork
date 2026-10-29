@@ -405,10 +405,16 @@ class ApiAntiSlopSampler:
             return True, None
 
         # ⸺ build hypothetical state ------------------------
+        # Create a minimal hypothetical state for validation
+        # We need to properly initialize the decoded buffer for validators
+        hypo_tokens = state.generated_token_strings[:truncate_idx] + [alt_token]
         hypo_state = GenerationState(state.prompt_string)
-        hypo_state.generated_token_strings = (
-            state.generated_token_strings[:truncate_idx] + [alt_token]
-        )
+        # Manually set the tokens and rebuild caches
+        hypo_state.generated_token_strings = hypo_tokens
+        # Rebuild decoded buffer and lens to match the tokens
+        from state.generation_state import _decode_token
+        hypo_state._decoded_buffer = "".join(_decode_token(t) for t in hypo_tokens)
+        hypo_state._decoded_lens = [len(_decode_token(t)) for t in hypo_tokens]
 
         for v in self.validators:
             vio = v.check(hypo_state)
@@ -985,9 +991,33 @@ class ApiAntiSlopSampler:
                         vio_full = self._run_validators(state)  # make sure regex ran
                         vio = vio_full or vio
 
+                    # Cancel the stream and fully consume/close it before backtracking
                     self.api_client.cancel_current_stream()
+                    # Drain the remaining stream to ensure HTTP connection is closed
+                    # This is critical for large models where vLLM may still be processing
+                    try:
+                        for _ in stream:
+                            pass  # Consume all remaining chunks
+                    except Exception:
+                        pass  # Ignore any errors during drain
+                    self._cancel_stream = False
+
+                    # Small delay to ensure connection is fully released before next request
+                    time.sleep(0.1)
 
                     fixed = self._perform_backtrack(state, vio)
+
+                    logger.info(
+                        f"Backtracking complete (fixed={fixed}), resuming generation. "
+                        f"State: {state.get_generated_length()} tokens, {len(state.get_generated_text())} chars"
+                    )
+
+                    # Reset connection pool after backtracking to prevent hanging
+                    # This is especially important for large models like Gemma 4 31B
+                    try:
+                        self.api_client.reset_connection_pool()
+                    except Exception as e:
+                        logger.warning(f"Failed to reset connection pool: {e}")
 
                     # ---------- NEW: event bookkeeping & callback ----------
                     event = {
@@ -1053,7 +1083,9 @@ class ApiAntiSlopSampler:
             if not restart_stream and (natural_end or regex_since > 0):
                 vio = self._run_validators(state)
                 if vio:
-                    self.api_client.cancel_current_stream()
+                    # Stream already ended, but add small delay before backtracking
+                    # to ensure connection is released (important for large models)
+                    time.sleep(0.1)
                     fixed = self._perform_backtrack(state, vio)
                     event = {
                         "type":  vio.validator_type,
@@ -1128,6 +1160,10 @@ class ApiAntiSlopSampler:
 
             # build prompt for backend
             full_prompt = prompt + state.get_generated_text()
+            logger.debug(
+                f"Chunk {chunk_nr}: Making API call (prompt_len={len(full_prompt)} chars, "
+                f"gen_len={state.get_generated_length()} tokens)"
+            )
 
             # ── API call timing ─────────────────────────────────────────────
             attempt = 0
