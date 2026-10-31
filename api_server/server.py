@@ -8,6 +8,8 @@ import copy
 
 from fastapi import FastAPI, Request, Response, status
 from fastapi.concurrency import run_in_threadpool
+from contextlib import asynccontextmanager
+import anyio.to_thread
 
 from api_client.base_client import BaseApiClient
 from core.sampler import ApiAntiSlopSampler
@@ -18,7 +20,30 @@ from utils.chat_template_helper import ChatTemplateFormatter
 # These will be populated by main.py at startup.
 SHARED_RESOURCES: Dict[str, Any] = {}
 
-app = FastAPI()
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    """
+    Apply the configured concurrency limit once the event loop exists.
+
+    anyio.to_thread.current_default_thread_limiter() raises NoEventLoopError
+    when called from synchronous code, so this cannot live in
+    setup_shared_resources() — it must run inside the ASGI lifespan.
+    """
+    max_concurrent = SHARED_RESOURCES.get("max_concurrent_requests")
+    if max_concurrent:
+        limiter = anyio.to_thread.current_default_thread_limiter()
+        limiter.total_tokens = int(max_concurrent)
+        logger = SHARED_RESOURCES.get("logger")
+        if logger:
+            logger.info(
+                f"anyio thread limiter set to {limiter.total_tokens} "
+                f"concurrent generations (default was 40)"
+            )
+    yield
+
+
+app = FastAPI(lifespan=_lifespan)
 
 def setup_shared_resources(
     config: Dict[str, Any],
@@ -37,6 +62,33 @@ def setup_shared_resources(
     SHARED_RESOURCES["chat_formatter"] = chat_formatter
     SHARED_RESOURCES["logger"] = main_logger
     SHARED_RESOURCES["tiktoken_model_name"] = config.get("model_name")
+
+    # --- Concurrency ---
+    # FastAPI's run_in_threadpool() is backed by anyio's *default* thread
+    # limiter, which caps at 40 tokens regardless of how many requests arrive.
+    # Beyond 40 in-flight requests, callers silently queue on the limiter
+    # (no error, no 503) and latency inflates with no throughput gain.
+    # Size it from the configured `max_concurrent_requests` (falling back to
+    # `threads` + 8, matching the upstream connection-pool sizing).
+    # The value is recorded here and applied in _lifespan(), because the
+    # limiter can only be reached from inside a running event loop.
+    #
+    # NOTE: these keys live under `generation_params` in the YAML, so read that
+    # first and only fall back to the top level for pre-flattened dicts.
+    gen_params = config.get("generation_params", {}) or {}
+    max_concurrent = (
+        config.get("max_concurrent_requests")
+        or gen_params.get("max_concurrent_requests")
+        or config.get("threads")
+        or gen_params.get("threads")
+        or 1
+    )
+    max_concurrent = max(1, int(max_concurrent))
+    SHARED_RESOURCES["max_concurrent_requests"] = max_concurrent
+    main_logger.info(
+        f"Concurrency limit configured: {max_concurrent} concurrent generations "
+        f"(anyio default would be 40)"
+    )
 
 
 def _run_generation_for_request(request_data: Dict[str, Any]) -> Dict[str, Any]:

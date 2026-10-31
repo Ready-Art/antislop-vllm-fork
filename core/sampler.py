@@ -333,6 +333,25 @@ class ApiAntiSlopSampler:
             f"tail_keep_tokens={self.tail_keep_tokens}"
         )
 
+        # --- Upstream round-trip cost -------------------------------------
+        # _generate_chunkwise() re-sends the whole prompt every chunk, so a
+        # single request costs ~(max_new_tokens / chunk_size) sequential
+        # prefill round-trips instead of one. That multiplies the backend
+        # prefill load by a large factor and caps real throughput well below
+        # the configured concurrency. Warn loudly rather than let it surprise
+        # anyone sizing a deployment.
+        if self.chunk_size and self.max_new_tokens:
+            round_trips = max(1, math.ceil(self.max_new_tokens / self.chunk_size))
+            if round_trips >= 10:
+                logger.warning(
+                    f"chunk_size={self.chunk_size} with max_new_tokens={self.max_new_tokens} "
+                    f"means ~{round_trips} sequential upstream round-trips per request, "
+                    f"each re-sending the full prompt. This multiplies backend prefill "
+                    f"cost by roughly {round_trips}x and will cap achievable throughput "
+                    f"well below max_concurrent_requests. Consider a larger chunk_size or "
+                    f"request_mode: stream."
+                )
+
         self.request_mode = config.get("generation_params", {}).get("request_mode", "chunk")
         self.regex_interval = int(config.get("regex_validation_interval", 20))
 

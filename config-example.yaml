@@ -41,7 +41,23 @@ system_prompt: ""        # optional; left empty → no system prompt
 # Generation Parameters
 generation_params:
   threads: 40
+
+  # Maximum number of generations the API server will run at once.
+  # FastAPI's run_in_threadpool() is backed by anyio's default thread limiter,
+  # which is hard-capped at 40 regardless of load. Anything beyond that queues
+  # silently (no error, no 503), inflating latency with no throughput gain.
+  # This value also sizes the upstream HTTP connection pool (value + 8), so raise
+  # the two together. Omit to default to threads + 8.
+  max_concurrent_requests: 128
+
   request_mode: chunk      # chunk | stream (stream might be buggy)
+
+  # NOTE: in chunk mode every chunk is a separate upstream call that re-sends
+  # the whole prompt, so round-trips ~= max_new_tokens / chunk_size.
+  # chunk_size: 20 with max_new_tokens: 600 means ~30 sequential prefill
+  # round-trips per request, which caps throughput far below the concurrency
+  # limit. Prefer a larger chunk_size (or request_mode: stream) when serving
+  # many concurrent clients.
   chunk_size: 20  # if using chunk request_mode
   top_logprobs_count: 20
   max_new_tokens: 600

@@ -275,8 +275,25 @@ def _get_api_client(cfg: Dict[str, Any], main_logger: logging.Logger) -> Optiona
         main_logger.error("model_name missing in configuration.")
         return None
 
-    # pool size = thread count + 8 (buffer); default thread count = 1
-    pool_size = int(cfg.get("threads", 1)) + 8
+    # Pool size must cover the number of *simultaneously in-flight*
+    # generations, not the batch `threads` value.  These used to be conflated
+    # (pool = threads + 8), so a config with threads: 8 handed out only 16
+    # sockets to 40+ threads, which then blocked waiting on a pooled connection.
+    #
+    # NOTE: `threads` / `max_concurrent_requests` live under
+    # `generation_params` in the YAML, so read that first and only fall back
+    # to the top level for callers that pass a pre-flattened dict.
+    gen_params = cfg.get("generation_params", {}) or {}
+    max_concurrent = (
+        cfg.get("max_concurrent_requests")
+        or gen_params.get("max_concurrent_requests")
+        or cfg.get("threads")
+        or gen_params.get("threads")
+        or 1
+    )
+    max_concurrent = max(1, int(max_concurrent))
+    # +8 headroom for retries / keep-alive churn
+    pool_size = max_concurrent + 8
 
     return ApiClient(
         api_key=api_key or "",
