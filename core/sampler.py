@@ -231,11 +231,15 @@ class ApiAntiSlopSampler:
         # stops are seen back-to-back (safety valve against infinite loops).
         # A "stop" WITHOUT a marker is still treated as genuinely terminal,
         # so user-configured stop_sequences keep working.
-        eos_markers = gen.get("end_of_turn_markers") or [
-            "<end_of_turn>",
-            "<turn|>",
+        # NOTE: `[]` is falsy, so a plain `or DEFAULT` would silently re-enable
+        # the feature for anyone who set `end_of_turn_markers: []` to turn it
+        # off.  Only fall back to the defaults when the key is *absent*.
+        eos_markers = gen.get("end_of_turn_markers")
+        if eos_markers is None:
+            eos_markers = ["<end_of_turn>", "<turn|>"]
+        self.end_of_turn_markers: List[str] = [
+            str(m).strip().lower() for m in eos_markers if str(m).strip()
         ]
-        self.end_of_turn_markers: List[str] = [str(m).strip().lower() for m in eos_markers]
         self.max_consecutive_stops = max(1, int(gen.get("max_consecutive_stops", 3)))
         # Counter for consecutive early end-of-turn stops (safety valve).
         self._consecutive_stops = 0
@@ -816,12 +820,13 @@ class ApiAntiSlopSampler:
                                     seen back-to-back (safety valve against an
                                     infinite loop if the model keeps trying to
                                     end its turn), then accept the stop.
+        - ``"stream_end"`` + marker → same as above.  vLLM closes the SSE
+                                    stream right after an EOS token, so the
+                                    marker usually surfaces as ``stream_end``
+                                    (from ``[DONE]``) rather than ``stop``.
+                                    Both are counted by the safety valve.
         - ``"stop"`` w/o marker   → a real terminal signal (e.g. a user
                                     stop-sequence); accept it immediately.
-        - other reason + marker   → the stream simply closed as a side-effect
-                                    of the stripped early EOS (e.g. vLLM's
-                                    ``stream_end`` / ``[DONE]``); keep
-                                    generating.
         - other reason, no marker → genuine stream end; accept.
 
         Returns True → accept the stop (terminate the run).
@@ -835,27 +840,36 @@ class ApiAntiSlopSampler:
             return False
 
         logger.info(f"finish_reason={reason}")
-        if reason == "stop" and had_eos_marker:
+
+        # Any stop that coincides with a stripped end-of-turn marker is a
+        # *premature* EOS, whatever name the backend gave it.  vLLM reports
+        # "stop" when the model emits the marker itself, but reports
+        # "stream_end" when the marker is followed by the [DONE] sentinel --
+        # which is the common case.  Both must be rejected AND both must count
+        # towards the safety valve.  Counting only "stop" left the
+        # "stream_end" path able to restart forever: no tokens are ever
+        # appended on that path, so max_new_tokens is never reached and the
+        # outer loop in _generate_streamwise() has no other exit.
+        #
+        # The counter stays genuinely *consecutive* because the `not reason`
+        # branch above resets it whenever a chunk arrives with no stop signal,
+        # i.e. whenever the model makes real progress.
+        if had_eos_marker and reason in ("stop", "stream_end"):
             self._consecutive_stops += 1
             if self._consecutive_stops < self.max_consecutive_stops:
                 logger.warning(
                     "Early end-of-turn marker stripped (consecutive stop "
-                    "%d/%d); continuing generation.",
-                    self._consecutive_stops, self.max_consecutive_stops,
+                    "%d/%d, finish_reason=%r); continuing generation.",
+                    self._consecutive_stops, self.max_consecutive_stops, reason,
                 )
                 return False
             logger.warning(
                 "End-of-turn markers hit %d consecutive stops; accepting the "
-                "stop (safety valve).", self.max_consecutive_stops,
+                "stop (safety valve, finish_reason=%r).",
+                self.max_consecutive_stops, reason,
             )
             self._consecutive_stops = 0
             return True
-
-        if had_eos_marker and reason in ("stream_end", None, ""):
-            # The SSE stream closed (``stream_end`` / ``[DONE]``) purely as a
-            # side-effect of the early EOS token we stripped above; it does
-            # NOT represent a terminal intent → keep generating.
-            return False
 
         # "stop" without any marker (a user stop_sequence), or a normal end of
         # stream with no early EOS involved → genuinely terminal.
@@ -1019,7 +1033,6 @@ class ApiAntiSlopSampler:
                             pass  # Consume all remaining chunks
                     except Exception:
                         pass  # Ignore any errors during drain
-                    self._cancel_stream = False
 
                     # Small delay to ensure connection is fully released before next request
                     time.sleep(0.1)

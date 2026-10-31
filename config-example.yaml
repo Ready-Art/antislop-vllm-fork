@@ -47,7 +47,7 @@ generation_params:
   # which is hard-capped at 40 regardless of load. Anything beyond that queues
   # silently (no error, no 503), inflating latency with no throughput gain.
   # This value also sizes the upstream HTTP connection pool (value + 8), so raise
-  # the two together. Omit to default to threads + 8.
+  # the two together. Omit to default to `threads`.
   max_concurrent_requests: 128
 
   request_mode: chunk      # chunk | stream (stream might be buggy)
@@ -73,7 +73,7 @@ generation_params:
   # BEFORE it enters the generation state (so it never leaks into the
   # output), and the accompanying finish_reason="stop" is treated as an
   # early, non-terminal signal: generation continues instead of being cut
-  # off mid-sentence.  Set to [] to disable this handling.
+  # off mid-sentence.  Set to [] to disable this handling entirely.
   end_of_turn_markers:
     - "<end_of_turn>"
     - "<turn|>"

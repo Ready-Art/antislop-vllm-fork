@@ -37,12 +37,15 @@ AntiSlop-vLLM can be used for single prompt completions or for generating entire
 *   **FTPO Pair Generation:** Captures (chosen, rejected) token pairs during backtracking, useful for creating datasets for Final Token Preference Optimization.
 *   **Chat Template Formatting:** Can apply Hugging Face chat templates to prompts before sending them to the completions endpoint.
 *   **Refusal Detection:** Optionally detects and flags model refusals in batch mode.
+*   **Early End-of-Turn Recovery:** Detects and strips premature end-of-turn markers (`<end_of_turn>`, `<turn|>`) that Gemma-class models emit mid-response under sampling, so the marker never leaks into your output and the response is not truncated mid-sentence. Configurable via `end_of_turn_markers` and `max_consecutive_stops`.
+*   **Tunable Server Concurrency:** `max_concurrent_requests` lifts the silent 40-request ceiling imposed by FastAPI's thread pool, and automatically sizes the upstream HTTP connection pool to match.
+*   **Banlist Builder (`utils/phrase_token_ids.py`):** Converts a plain JSON list of phrases into a token-ID banlist for a given tokenizer, with deduplication and validation.
 *   **Configurable:** Extensive configuration via `config.yaml` and command-line arguments.
 
 ## How it Works
 
 1.  **API Interaction:** The system sends requests to the `/v1/completions` endpoint of your specified API. It's crucial that the API can return `logprobs` for the generated tokens.
-2.  **Generation:** Text is generated either in discrete chunks (`request_mode: chunk`) or token-by-token via a stream (`request_mode: stream`).
+2.  **Generation:** Text is generated either in discrete chunks (`request_mode: chunk`) or token-by-token via a stream (`request_mode: stream`). `chunk` is the default; `stream` avoids the repeated prefill cost of chunk mode — see [Chunk mode and throughput](#chunk-mode-and-throughput).
 3.  **Validation:** After each new piece of text is generated, it's passed through a series of active validators:
     *   `SlopPhraseValidator`: Checks against a list of exact phrases.
     *   `RegexValidator`: Matches text against a list of regex patterns.
@@ -70,6 +73,10 @@ AntiSlop-vLLM can be used for single prompt completions or for generating entire
     *   `tqdm`
     *   `transformers>=4.40.0` (for chat templates, refusal detector, and `auto_unslop.py`)
     *   `regex`
+    *   `fastapi` and `uvicorn[standard]` (only needed for API server mode, Example 3)
+    *   `tokenizers` (only needed for `utils/phrase_token_ids.py`; install with `pip install tokenizers`)
+
+> **Note:** `fastapi` and `uvicorn[standard]` are already included in `requirements.txt`. `tokenizers` is **not** — install it separately (`pip install tokenizers`) if you intend to use the banlist builder described below.
 
 ## Installation & Setup
 
@@ -109,6 +116,8 @@ Modify `config.yaml` for persistent settings. Key options include:
 *   `regex_blocklist_file`
 *   `ngram_validator` (including `banned_file`, `remove_stopwords`, `language`)
 *   `generation_params` (like `max_new_tokens`, `temperature`, `top_p`, `top_k`, `min_p`, `chunk_size`, `request_mode`)
+*   `generation_params.end_of_turn_markers`, `generation_params.max_consecutive_stops` (early end-of-turn recovery, see below)
+*   `generation_params.max_concurrent_requests` (API server concurrency, see below)
 *   `prompt_template`, `system_prompt` (for dataset generation)
 *   `logging_level`
 
@@ -208,6 +217,68 @@ print(response.choices[0].message.content)
 
 See `example_api_server.ipynb` for a complete example.
 
+#### Tuning server concurrency
+
+FastAPI's `run_in_threadpool()` is backed by anyio's default thread limiter, which is hard-capped at **40** worker threads regardless of how many requests arrive. Past that, requests queue silently — no error, no `503` — so latency climbs while throughput stays flat. AntiSlop-vLLM raises this ceiling from config:
+
+```yaml
+generation_params:
+  max_concurrent_requests: 128   # default: falls back to `threads`
+```
+
+This value is applied at server startup and also sizes the upstream HTTP connection pool (`max_concurrent_requests + 8`), so raise both together. Set it at least as high as the number of clients you expect to serve simultaneously.
+
+> **Note:** the limiter is process-global. That is correct for the default single-process `uvicorn.run(app, ...)`, but if you ever run with `workers=N`, note that the regex process pool and the shared HTTP session cache are module globals and therefore become per-process.
+
+#### Chunk mode and throughput
+
+In `request_mode: chunk`, every chunk is a separate upstream call that re-sends the entire prompt. A single request therefore costs roughly `max_new_tokens / chunk_size` sequential prefill round-trips — `chunk_size: 20` with `max_new_tokens: 600` means ~30 of them, multiplied by your concurrency. AntiSlop logs a warning at sampler construction when this ratio reaches 10 or more. If you are serving many concurrent clients, prefer a larger `chunk_size` or `request_mode: stream`, which removes the round-trip cost entirely.
+
+### Handling premature end-of-turn markers
+
+Some models — notably the Gemma family — emit their end-of-turn token prematurely while sampling at `temperature > 0`, and the backend reports `finish_reason="stop"`. Left unhandled, this both leaks the raw marker into your output and cuts the response off mid-sentence.
+
+AntiSlop-vLLM strips any trailing end-of-turn marker from each chunk **before** it enters the generation state (so it never appears in the output), and treats the accompanying `stop` as an early, non-terminal signal: generation continues instead of ending. A `stop` that arrives *without* a marker — for example one produced by your own `stop_sequences` — is still treated as terminal, so normal stop behaviour is unaffected.
+
+```yaml
+generation_params:
+  end_of_turn_markers:
+    - "<end_of_turn>"
+    - "<turn|>"
+  max_consecutive_stops: 3
+```
+
+*   `end_of_turn_markers`: the markers to strip. Defaults to `<end_of_turn>` and `<turn|>`. If you use a model with different markers (e.g. ChatML's `<|im_end|>`), list them here.
+*   `max_consecutive_stops`: how many early stops to tolerate back-to-back before accepting the stop anyway. This is a safety valve against runaway restarts; lower it if you see repeated restarts, raise it if responses are still being truncated. Note that both `finish_reason="stop"` and `finish_reason="stream_end"` count towards this limit — vLLM typically reports the latter, because it closes the SSE stream as soon as an EOS token is emitted.
+
+> **Note:** setting `end_of_turn_markers: []` disables the feature entirely. Use this if you are running a model whose end-of-turn markers you do not want stripped, or if you are debugging output length.
+
+### Building a token-ID banlist (`utils/phrase_token_ids.py`)
+
+If you maintain your own list of slop phrases, this helper converts a flat JSON array of strings into an AntiSlop banlist of `[["phrase", first_token_id], ...]` pairs for a specific tokenizer:
+
+```bash
+pip install tokenizers
+python utils/phrase_token_ids.py \
+    --phrases   slop_phrases_flat.json \
+    --tokenizer /path/to/tokenizer.json \
+    --out       banlists/my_slop_phrases.json \
+    --report    banlists/my_slop_phrases.report.txt
+```
+
+Input is a plain JSON list:
+
+```json
+[
+  "took a deep breath",
+  "voice barely above a whisper"
+]
+```
+
+The script lowercases and de-duplicates entries, and validates each phrase — rejecting any that encode to zero tokens, produce IDs outside the vocabulary, or fail a decode round-trip check. Pass `--report` to get a readable summary of what was kept, dropped, or excluded and why, plus the full token-ID sequence for every kept phrase. The banlist itself stores only the **first** token ID of each phrase.
+
+> The input parser is tolerant: if your JSON is missing a comma between two adjacent `"string"` lines, it repairs the file in memory and reports each repair rather than failing.
+
 ### Iterative Anti-Slop (`auto_unslop.py`)
 
 The `auto_unslop.py` script provides a pipeline for iteratively refining ban lists and improving generation quality. In each iteration, it:
@@ -249,10 +320,16 @@ While `antislop-vllm` is based on the concepts of the original `antislop-sampler
     *   `generation_state.py`: Manages the state of the text being generated.
 *   `validators/`: Implements different validation strategies (`SlopPhraseValidator`, `RegexValidator`, `NGramValidator`).
 *   `utils/`: Helper functions for configuration, string manipulation, chat templates, refusal detection, etc.
+    *   `phrase_token_ids.py`: Standalone CLI that converts a flat JSON phrase list into a token-ID banlist for a given tokenizer.
 *   `banlists/`: Directory for example ban list files (JSON format). **Users should curate their own lists.**
 *   `data/`: Can store auxiliary data like human writing profiles for `auto_unslop.py`.
 *   `results/`: Default output directory for batch generations and `auto_unslop.py` experiments.
 *   `example_run_antislop_vllm.ipynb`: Jupyter notebook with usage examples.
+
+## Known Issues
+
+*   **`ApiClient` instances resolve their session per request, not at construction.** Sessions are shared per `base_url` and reference-counted, so `reset_connection_pool()` retires a session that is still in use instead of closing it, and the last request to finish closes it. This is safe to call while other requests are in flight. If you are building on `ApiClient` directly, do not cache `_lease_session()`'s result beyond the request — the session can be retired at any time.
+*   The concurrency limiter and the session registry are process-global, so they do not compose with `uvicorn --workers`. See the note under [Tuning server concurrency](#tuning-server-concurrency).
 
 ## Disclaimers
 

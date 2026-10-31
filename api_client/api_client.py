@@ -1,6 +1,8 @@
 import json
 import logging
-from typing import Dict, List, Optional, Tuple
+import threading
+from contextlib import ExitStack, contextmanager
+from typing import Dict, Iterator, List, Optional, Tuple
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -11,7 +13,71 @@ from core.models import ApiChunkResult
 
 logger = logging.getLogger(__name__)
 
-_SHARED_SESSIONS: Dict[str, requests.Session] = {}
+
+class _SessionPool:
+    """
+    One shared ``requests.Session`` for a ``base_url``, plus a count of how many
+    requests are currently using it.
+
+    Reference counting is what makes ``reset_connection_pool()`` safe: a session
+    with ``active > 0`` is *retired* rather than closed, so its users keep a
+    working pool and the last one to finish closes it.  This also keeps every
+    client on the *same* session, so the configured pool size still bounds total
+    upstream connections.
+    """
+
+    __slots__ = ("session", "pool_size", "active", "retired")
+
+    def __init__(self, session: requests.Session, pool_size: int) -> None:
+        self.session = session
+        self.pool_size = pool_size
+        self.active = 0
+        self.retired = False
+
+
+# Sessions are shared per base_url so that N ApiClient instances (one per batch
+# worker, or per request in server mode) do not each open their own pool.
+_SESSIONS_LOCK = threading.RLock()
+_SHARED_POOLS: Dict[str, _SessionPool] = {}
+
+
+@contextmanager
+def _lease_session(base_url: str, pool_size: int) -> Iterator[requests.Session]:
+    """
+    Lease the shared session for *base_url* for the duration of one request.
+
+    The session cannot be closed by a concurrent ``reset_connection_pool()`` while
+    the lease is held: the reset only marks it retired, and the close is deferred
+    to whichever request releases it last.  This is what makes a mid-stream reset
+    safe.
+    """
+    pool = None
+    try:
+        with _SESSIONS_LOCK:
+            pool = _SHARED_POOLS.get(base_url)
+            if pool is None:
+                pool = _SessionPool(ApiClient._build_session(pool_size), pool_size)
+                _SHARED_POOLS[base_url] = pool
+            pool.active += 1
+            session = pool.session
+        yield session
+    finally:
+        if pool is not None:
+            _release_pool(pool)
+
+
+def _release_pool(pool: _SessionPool) -> None:
+    """Drop one reference; close the session if it was retired and now idle."""
+    with _SESSIONS_LOCK:
+        pool.active -= 1
+        should_close = pool.retired and pool.active <= 0
+    if should_close:
+        try:
+            pool.session.close()
+            logger.info("Closed retired API session (last user finished).")
+        except Exception as e:
+            logger.warning(f"Error closing retired session: {e}")
+
 
 class ApiClient(BaseApiClient):
     """
@@ -41,16 +107,21 @@ class ApiClient(BaseApiClient):
         self.base_url = base_url
         self.completion_endpoint = f"{self.base_url}/completions"
 
-        # -------- reuse or create session -------------
-        try:
-            self._session = _SHARED_SESSIONS[self.base_url]      # ← reuse
-        except KeyError:
-            self._session = self._build_session(pool_size)       # ← create once
-            _SHARED_SESSIONS[self.base_url] = self._session
+        # -------- adopt the shared pool -------------
+        # No session is opened here, and no reference to one is retained: every
+        # request leases the *current* session for its base_url (see
+        # _lease_session).  Holding a session (or pool) on the instance would go
+        # stale as soon as another client reset the pool.
+        with _SESSIONS_LOCK:
+            pool = _SHARED_POOLS.get(self.base_url)
+            if pool is None:
+                pool = _SessionPool(self._build_session(pool_size), pool_size)
+                _SHARED_POOLS[self.base_url] = pool
+            self.pool_size = pool.pool_size
 
         logger.info(
             f"ApiClient ready (endpoint={self.completion_endpoint}, "
-            f"shared_pool={pool_size})"
+            f"shared_pool={self.pool_size})"
         )
 
     # ------------------------------------------------------------------ #
@@ -82,39 +153,53 @@ class ApiClient(BaseApiClient):
 
     def reset_connection_pool(self):
         """
-        Close all connections in the pool and create a fresh session.
-        Useful when the server appears to be stuck or unresponsive.
-        
-        This resets the shared session for this base_url, so all ApiClient
-        instances using the same base_url will get a fresh connection pool.
+        Replace the shared connection pool for this ``base_url`` with a fresh one.
+
+        Useful when the server appears stuck or unresponsive and stale keep-alive
+        connections need to be discarded.
+
+        This is safe to call while other requests are in flight.  The old session
+        is **retired, not closed**: any request still using it keeps a working
+        pool, and the session is closed by whichever request releases it last.
+        New requests immediately get the replacement session.
+
+        Previously this closed the shared session and dropped it from the cache
+        outright, while every other ApiClient kept its own reference to that now
+        closed object.  ``Session.close()`` does not break an in-flight response,
+        so nothing crashed -- but the clients silently diverged onto separate
+        pools, and the configured ``pool_maxsize`` cap stopped applying to the
+        whole process.  Each reset could therefore multiply the number of upstream
+        connections, which is precisely what the pool sizing is meant to bound.
         """
-        logger.info("Resetting API client connection pool")
-        try:
-            # Close the current session (this should close all pooled connections)
-            self._session.close()
-        except Exception as e:
-            logger.warning(f"Error closing session: {e}")
-        
-        # Remove from shared cache
-        _SHARED_SESSIONS.pop(self.base_url, None)
-        
-        # Create a fresh session with the same pool size
-        # Estimate pool size from the current adapter if possible, otherwise use default
-        pool_size = 10  # Default reasonable size
-        try:
-            # Try to get pool size from current adapter before it's closed
-            pass  # We'll just use default for simplicity
-        except Exception:
-            pass
-        
-        # Build new session and update shared cache
-        new_session = self._build_session(pool_size)
-        _SHARED_SESSIONS[self.base_url] = new_session
-        
-        # Update this instance's session reference
-        self._session = new_session
-        
-        logger.info(f"New API client session created (pool_size={pool_size})")
+        pool_size = max(1, int(getattr(self, "pool_size", 10)))
+
+        with _SESSIONS_LOCK:
+            old = _SHARED_POOLS.get(self.base_url)
+            new_pool = _SessionPool(self._build_session(pool_size), pool_size)
+            _SHARED_POOLS[self.base_url] = new_pool
+
+            old_idle = old is None or old.active <= 0
+            if old is not None and not old_idle:
+                old.retired = True
+
+        if old is None:
+            logger.info(f"Connection pool reset (pool_size={pool_size}).")
+            return
+
+        if old_idle:
+            try:
+                old.session.close()
+            except Exception as e:
+                logger.warning(f"Error closing session: {e}")
+            logger.info(
+                f"Connection pool reset (pool_size={pool_size}, old session closed)."
+            )
+        else:
+            logger.info(
+                f"Connection pool reset (pool_size={pool_size}); old session "
+                f"retired with {old.active} request(s) still in flight and will "
+                f"close when they finish."
+            )
 
     # ------------------------------------------------------------------ #
     #  NEW: streaming generator                                          #
@@ -188,13 +273,22 @@ class ApiClient(BaseApiClient):
         # ---------- open HTTP stream ---------------------------------------
         last_finish_reason = None
         try:
-            with self._session.post(
-                self.completion_endpoint,
-                headers=headers,
-                json=payload,
-                stream=True,
-                timeout=timeout,
-            ) as resp:
+            # Lease a session for the whole life of this stream, and open the
+            # response through it.  Both are released when this generator is
+            # exhausted or closed, so a concurrent reset_connection_pool() retires
+            # the session instead of closing it and cannot tear this stream down
+            # mid-flight.
+            with ExitStack() as stack:
+                session = stack.enter_context(
+                    _lease_session(self.base_url, self.pool_size)
+                )
+                resp = stack.enter_context(session.post(
+                    self.completion_endpoint,
+                    headers=headers,
+                    json=payload,
+                    stream=True,
+                    timeout=timeout,
+                ))
                 resp.raise_for_status()
 
                 for raw in resp.iter_lines(decode_unicode=True):
@@ -351,13 +445,20 @@ class ApiClient(BaseApiClient):
         logger.debug(f"Payload: {json.dumps(payload)[:500]}")
 
         try:
-            resp = self._session.post(
-                self.completion_endpoint,
-                headers=headers,
-                json=payload,
-                timeout=timeout,
-            )
-            resp.raise_for_status()
+            # Lease the session for the request and the body read only; the
+            # response is fully buffered by resp.json(), so the lease can be
+            # released before the (possibly slow) payload parsing below.  A
+            # concurrent reset_connection_pool() retires the session rather than
+            # closing it while this request is using it.
+            with _lease_session(self.base_url, self.pool_size) as session:
+                resp = session.post(
+                    self.completion_endpoint,
+                    headers=headers,
+                    json=payload,
+                    timeout=timeout,
+                )
+                resp.raise_for_status()
+                data = resp.json()
         except requests.exceptions.Timeout:
             logger.error("API request timed out.")
             raise
@@ -369,7 +470,6 @@ class ApiClient(BaseApiClient):
                 pass
             raise
 
-        data = resp.json()
         logger.debug(f"Raw response: {json.dumps(data)[:2000]}")
 
         # Pass-through OpenAI-style error embedded in a 200 OK
